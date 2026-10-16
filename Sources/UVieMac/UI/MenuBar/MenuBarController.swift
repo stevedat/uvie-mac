@@ -124,9 +124,11 @@ final class MenuBarController: ObservableObject {
         // top-right corner when a newer release is known. Clears itself
         // once the app is updated (the version comparison flips).
         if UpdateChecker.shared.hasUpdate {
-            let d: CGFloat = 4.5
-            let dot = NSRect(x: rect.maxX - d / 2,
-                             y: rect.maxY - d / 2,
+            let d: CGFloat = 6.5
+            // Inset slightly from the corner so the full circle stays inside
+            // the 24pt canvas instead of clipping the right/top edge.
+            let dot = NSRect(x: rect.maxX - 1.5 - d / 2,
+                             y: rect.maxY - 1.5 - d / 2,
                              width: d, height: d)
             NSColor.systemBlue.setFill()
             NSBezierPath(ovalIn: dot).fill()
