@@ -26,6 +26,13 @@ extension EventTap {
                 customChordTapArmed = false
                 Logger.shared.warn("EventTap: tap was disabled (rawType=\(rawType)), re-enabled, Fn state reset")
             }
+            // Keystrokes reached the app raw while the tap was down — the
+            // composing state, committed-word history and caret tracking no
+            // longer match the screen. Drop them all (outside the `if let tap`
+            // guard so it still runs when the tap reference is gone).
+            _engine.reset()
+            editCaretBack = 0
+            invalidateWebContentCache()
             return Unmanaged.passRetained(event)
         }
 
@@ -183,11 +190,18 @@ extension EventTap {
            !isAXApp {
             if _engine.isComposing {
                 commitAndInject()
-            }
-            if keyCode == 123 {
-                editCaretBack += 1
+                // The just-committed word becomes the newest committed word —
+                // its end IS the caret position, so the anchor re-roots here.
+                // Left lands one char inside the word end (+1); Right lands
+                // one char right of it (-1). Applying the +/- to the previous
+                // offset (which was measured from the OLD anchor and drifts
+                // with every transform keystroke) produced wrong caretBacks:
+                // the edit either missed entirely or rewrote the wrong word,
+                // and the typed char fell through to feed() and was inserted
+                // literally mid-word.
+                editCaretBack = keyCode == 123 ? 1 : -1
             } else {
-                editCaretBack -= 1
+                editCaretBack += keyCode == 123 ? 1 : -1
             }
             perfEnd("break-arrow", keyCode: keyCode, app: app)
             return Unmanaged.passRetained(event)
@@ -355,6 +369,12 @@ extension EventTap {
             return Unmanaged.passRetained(event)
         }
 
+        // The engine consumed the backspace while composing: the caret moved
+        // by the rendered delta (inserted suffix chars minus erased chars).
+        // Track it the same way as the feed path so the anchor offset stays
+        // accurate for post-commit editing.
+        editCaretBack -= out.utf16.count - bs
+
         // CGEvent path: selection-based for compound apps (no flicker),
         // plain backspace for regular apps.
         if bs > 0 {
@@ -401,8 +421,15 @@ extension EventTap {
             // The anchor moves to the just-committed word's end. When the
             // engine was composing, the caret sits 1 right of it (the space);
             // when idle, the caret was already right of the anchor and just
-            // moves 1 further right.
-            editCaretBack = wasComposing ? -1 : editCaretBack - 1
+            // moves 1 further right — unless it sat INSIDE committed text
+            // (offset > 0), where inserting a char breaks the ring geometry
+            // and the history must be dropped.
+            if !wasComposing && editCaretBack > 0 {
+                _engine.reset()
+                editCaretBack = 0
+            } else {
+                editCaretBack = wasComposing ? -1 : editCaretBack - 1
+            }
 
             // Check if the committed text ends with sentence delimiter
             // Note: Space after .!? doesn't make it a new sentence start yet
@@ -481,12 +508,41 @@ extension EventTap {
             }
 
             let wasComposing = _engine.isComposing
-            commitAndInject()
-            // The anchor moves to the just-committed word's end. When the
-            // engine was composing, the caret sits 1 right of it (the break
-            // char); when idle, the caret keeps its offset and moves 1
-            // further right past the inserted break char.
-            editCaretBack = wasComposing ? -1 : editCaretBack - 1
+            if keyCode == 117 {
+                // Forward Delete removes the char right of the caret — the
+                // caret itself does not move and NO boundary char is
+                // inserted. Commit only a live composition: an idle commit
+                // pushes an empty phantom word into the ring, and since the
+                // phantom claims a separator char that doesn't exist on
+                // screen it shadows the real word at the caret (the next
+                // keystroke would "edit" the phantom instead of the word).
+                if wasComposing {
+                    commitAndInject()
+                }
+                // At or left of the anchor (offset >= 0) the deleted char
+                // belonged to committed text, so the history is stale; right
+                // of it the deletion shrinks the caret's distance by one.
+                if editCaretBack >= 0 {
+                    _engine.reset()
+                    editCaretBack = 0
+                } else {
+                    editCaretBack += 1
+                }
+            } else {
+                commitAndInject()
+                if !wasComposing && editCaretBack > 0 {
+                    // A break char inserted inside committed text breaks the
+                    // ring geometry — same reset as the space path.
+                    _engine.reset()
+                    editCaretBack = 0
+                } else {
+                    // The anchor moves to the just-committed word's end. When
+                    // the engine was composing, the caret sits 1 right of it
+                    // (the break char); when idle, the caret keeps its offset
+                    // and moves 1 further right past the inserted break char.
+                    editCaretBack = wasComposing ? -1 : editCaretBack - 1
+                }
+            }
 
             // Enter/Return starts a new sentence
             updateSentenceStartStateForBreakKey(keyCode)
@@ -556,11 +612,18 @@ extension EventTap {
         }
 
         if type == .keyUp {
+            if passedThroughKeys.remove(keyCode) != nil {
+                // The keyDown went to the app untouched — its keyUp must
+                // follow or the app sees a key it never released.
+                perfEnd("char-keyup-pass", keyCode: keyCode, app: app)
+                return Unmanaged.passRetained(event)
+            }
             perfEnd("char-keyup", keyCode: keyCode, app: app)
             return nil  // Suppress original keyUp; we already sent synthetic
         }
 
         guard let firstChar = glyph else {
+            passedThroughKeys.insert(keyCode)
             perfEnd("char-pass", keyCode: keyCode, app: app)
             return Unmanaged.passRetained(event)
         }
@@ -619,10 +682,12 @@ extension EventTap {
 
         let (bs, out) = _engine.feed(char: transformedChar)
         // Typing right of the anchor (editCaretBack < 0) starts a fresh word
-        // after it; each char moves the caret 1 further from the anchor. At
-        // or left of the anchor the offset was just re-anchored to 0 above.
+        // after it. Track the RENDERED delta, not the keystroke: transforms
+        // replace existing chars (bs>0) and consumed modifier keys produce no
+        // output, so `-= 1` per key drifted the offset by the transform count
+        // and broke boundary matching for post-commit editing.
         if editCaretBack < 0 {
-            editCaretBack -= 1
+            editCaretBack -= out.utf16.count - bs
         }
         // Gate the whole trace call — when trace is off (the common case) the
         // string interpolation and the isCompoundApp/isChromium Set lookups
@@ -639,6 +704,7 @@ extension EventTap {
         // it (the exact failure the non-ASCII guard above prevents). Let the
         // app handle the key natively instead. Mirrors `AXTextInjector.feed`.
         if bs == 0 && out.isEmpty && !_engine.isComposing {
+            passedThroughKeys.insert(keyCode)
             perfEnd("char-unhandled", keyCode: keyCode, app: app)
             return Unmanaged.passRetained(event)
         }
@@ -676,10 +742,16 @@ extension EventTap {
             }
         }
 
-        // Additional backspace if engine didn't catch all
+        // Additional backspace if engine didn't catch all — route through
+        // the compound-aware path so compound apps get their selection/
+        // sentinel strategy instead of raw backspaces.
         if abbreviationLength > bs {
             let remaining = abbreviationLength - bs
-            outputSink.applyBackspaces(remaining)
+            if isCompoundApp {
+                outputSink.applyCompoundBackspaces(bs: remaining, out: "")
+            } else {
+                outputSink.applyBackspaces(remaining)
+            }
         }
 
         // Insert the expansion
@@ -715,12 +787,17 @@ extension EventTap {
 
         // Character keys: consume the real event and re-post as synthetic.
         if type == .keyUp {
+            if passedThroughKeys.remove(keyCode) != nil {
+                // Passed-through keyDown — let the keyUp follow.
+                return Unmanaged.passRetained(event)
+            }
             // Suppress the original keyUp — the synthetic keyDown already
             // produced the visible character.
             return nil
         }
 
         guard let firstChar = characterFromCGEvent(event) else {
+            passedThroughKeys.insert(keyCode)
             return Unmanaged.passRetained(event)
         }
 

@@ -371,10 +371,167 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(sink.calls, [.text("s")])
     }
 
-    /// Maps a character to a plausible keycode for the synthetic event
-    /// (only the unicode payload matters to `characterFromCGEvent`).
+    /// Arrow-left WHILE composing commits the word and makes it the newest
+    /// committed word — the anchor must re-root at the caret. The old code
+    /// applied +/-1 to the offset measured from the previous anchor, so for
+    /// any word typed after a committed word the tracked offset was wrong:
+    /// the edit missed and the typed char was inserted literally mid-word.
+    func test_editCommittedWord_arrowWhileComposingReanchors() {
+        // "ab " committed, "don" still composing; one left arrow lands the
+        // caret at "do|n" and 's' must mid-word-edit "don" → "dón".
+        for ch in "ab " {
+            if ch == " " {
+                assertPassed(send(tap, .keyDown, keyDownEvent(49)))
+            } else {
+                assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+            }
+        }
+        for ch in "don" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        XCTAssertTrue(tap._engine.isComposing)
+        assertPassed(send(tap, .keyDown, keyDownEvent(123)))  // left arrow
+        XCTAssertEqual(tap.editCaretBack, 1)
+
+        sink.reset()
+        assertConsumed(send(tap, .keyDown, keyDownEvent(1, unicode: "s")))
+        XCTAssertEqual(sink.calls, [.forwardDeletes(1), .backspaces(2), .text("dón")])
+    }
+
+    /// Same re-anchor, but the composing word contains transform keystrokes
+    /// ("vieejt" → "việt") that drifted the naive -1-per-key tracking.
+    func test_editCommittedWord_transformedWordArrowReanchors() {
+        assertPassed(send(tap, .keyDown, keyDownEvent(49)))    // leading space state
+        for ch in "vieejt" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        assertPassed(send(tap, .keyDown, keyDownEvent(123)))
+        XCTAssertEqual(tap.editCaretBack, 1)
+
+        sink.reset()
+        assertConsumed(send(tap, .keyDown, keyDownEvent(1, unicode: "s")))
+        XCTAssertEqual(sink.calls, [.forwardDeletes(1), .backspaces(3), .text("viết")])
+    }
+
+    /// A backspace consumed while composing moves the caret by the rendered
+    /// delta — the anchor offset must track it for later arrows/edits.
+    func test_backspaceWhileComposing_updatesAnchorOffset() {
+        for ch in "ab " {
+            if ch == " " {
+                assertPassed(send(tap, .keyDown, keyDownEvent(49)))
+            } else {
+                assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+            }
+        }
+        for ch in "don" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        XCTAssertEqual(tap.editCaretBack, -4)  // space + 3 rendered chars
+
+        assertConsumed(send(tap, .keyDown, keyDownEvent(51)))  // backspace
+        XCTAssertEqual(tap.editCaretBack, -3)
+    }
+
+    /// Numpad Enter (76) is a break key, not a character: it must commit the
+    /// composing word and pass through natively (posting "\r" as text loses
+    /// the submit/newline semantics in forms and chat fields).
+    func test_numpadEnter_commitsAndPassesThrough() {
+        for ch in "vie" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        XCTAssertTrue(tap._engine.isComposing)
+
+        assertPassed(send(tap, .keyDown, keyDownEvent(76)))
+        XCTAssertFalse(tap._engine.isComposing)
+        XCTAssertTrue(tap.isAtSentenceStart)
+    }
+
+    /// Forward Delete removes the char right of the caret without moving it.
+    /// Deleting the commit space lands the caret on the word end — the same
+    /// position the idle-backspace path uses to arm post-commit editing.
+    func test_forwardDelete_deletingSpaceArmsEdit() {
+        for ch in "don" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        assertPassed(send(tap, .keyDown, keyDownEvent(49)))   // space → offset -1
+        assertPassed(send(tap, .keyDown, keyDownEvent(117)))  // fwd-del → offset 0
+        XCTAssertEqual(tap.editCaretBack, 0)
+
+        sink.reset()
+        assertConsumed(send(tap, .keyDown, keyDownEvent(1, unicode: "s")))
+        XCTAssertEqual(sink.calls, [.backspaces(2), .text("ón")])
+    }
+
+    /// Inserting a space inside committed text (offset > 0) breaks the ring
+    /// geometry — the history must reset, not drift.
+    func test_spaceInsideCommittedText_resetsHistory() {
+        for ch in "don" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        assertPassed(send(tap, .keyDown, keyDownEvent(49)))   // offset -1
+        assertPassed(send(tap, .keyDown, keyDownEvent(123)))  // at "don|" → 0
+        assertPassed(send(tap, .keyDown, keyDownEvent(123)))  // "do|n" → +1
+        XCTAssertEqual(tap.editCaretBack, 1)
+
+        assertPassed(send(tap, .keyDown, keyDownEvent(49)))   // space mid-word
+        XCTAssertEqual(tap.editCaretBack, 0)
+        XCTAssertFalse(tap._engine.isComposing)
+    }
+
+    /// When the system disables the tap (timeout/user input), keystrokes
+    /// reach the app raw. On the re-enable notification the engine state is
+    /// stale — it must be dropped or the next keystroke diffs against text
+    /// that no longer matches the screen (ghost characters).
+    func test_tapReenabled_resetsEngineState() {
+        for ch in "vie" {
+            assertConsumed(send(tap, .keyDown, keyDownEvent(keyCode(for: ch), unicode: String(ch))))
+        }
+        XCTAssertTrue(tap._engine.isComposing)
+
+        // kCGEventTapDisabledByTimeout — the handle() path re-enables and
+        // must reset engine state regardless of the tap handle.
+        let disabled = CGEventType(rawValue: 0xFFFFFFFE)!
+        assertPassed(send(tap, disabled, keyDownEvent(0, unicode: "v")))
+        XCTAssertFalse(tap._engine.isComposing)
+        XCTAssertEqual(tap.editCaretBack, 0)
+    }
+
+    /// In an AX app, a character whose injection declined passes through —
+    /// its keyUp must follow (the keyDown went to the app natively).
+    func test_passedThroughKeyDown_keepsItsKeyUp_axPath() {
+        detector.bundleID = "com.apple.Spotlight"
+        axInjector.feedSuccess = false
+        assertPassed(send(tap, .keyDown, keyDownEvent(9, unicode: "v")))
+        assertPassed(send(tap, .keyUp, keyUpEvent(9, unicode: "v")))
+    }
+
+    /// A marked passed-through keyCode releases once, then the set forgets
+    /// it: a later consumed keyDown suppresses its keyUp again.
+    func test_passedThroughKey_releasesOnceThenForgets() {
+        tap.passedThroughKeys.insert(0)
+        assertPassed(send(tap, .keyUp, keyUpEvent(0)))
+        assertConsumed(send(tap, .keyDown, keyDownEvent(0, unicode: "a")))
+        assertConsumed(send(tap, .keyUp, keyUpEvent(0)))
+    }
+
+    /// The complementary invariant: a consumed keyDown still suppresses its
+    /// keyUp (the synthetic replacement was already posted).
+    func test_consumedKeyDown_stillSuppressesKeyUp() {
+        assertConsumed(send(tap, .keyDown, keyDownEvent(9, unicode: "v")))
+        assertConsumed(send(tap, .keyUp, keyUpEvent(9, unicode: "v")))
+    }
+
+    /// Maps a character to its mac virtual keycode so the event routes like
+    /// a real keystroke (ASCII values collide with break keys: 't'=116 is
+    /// PageUp, 'u'=117 Forward Delete, 'w'=119 End, 'y'=121 PageDown).
     private func keyCode(for ch: Character) -> Int64 {
-        Int64(ch.asciiValue ?? 0)
+        let map: [Character: Int64] = [
+            "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7,
+            "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15,
+            "y": 16, "t": 17, "u": 32, "i": 34, "o": 31, "p": 35, "l": 37,
+            "j": 38, "k": 40, "n": 45, "m": 46,
+        ]
+        return map[ch] ?? Int64(ch.asciiValue ?? 0)
     }
 
     // MARK: - Modifiers & mouse

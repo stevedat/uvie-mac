@@ -80,6 +80,10 @@ final class AppContextDetector: AppContextDetecting {
     /// Primary: AXUIElement focused application.
     private func getFocusedAppBundleID() -> String? {
         let systemWide = AXUIElementCreateSystemWide()
+        // Bound the AX round-trip: this runs on the event-tap callback and a
+        // hung target app would otherwise stall the tap past the system
+        // timeout (all typing freezes until the tap is re-enabled).
+        AXUIElementSetMessagingTimeout(systemWide, 0.15)
         var focusedApp: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
             systemWide,

@@ -128,7 +128,7 @@ final class AXTextInjector {
                 var newText = String(current.dropLast(abbreviationLength))
                 newText += expansion
 
-                setTextValue(element, text: newText)
+                _ = setTextValue(element, text: newText)
                 setCursorToEnd(element, length: newText.utf16.count)
                 engine.reset()
                 return true
@@ -146,6 +146,9 @@ final class AXTextInjector {
 
     private func getFocusedTextElement() -> AXUIElement? {
         let systemWide = AXUIElementCreateSystemWide()
+        // Bound the AX round-trips on the event-tap callback: a hung target
+        // app would otherwise stall the tap past the system timeout.
+        AXUIElementSetMessagingTimeout(systemWide, 0.15)
         var focusedElement: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
             systemWide,
@@ -160,6 +163,7 @@ final class AXTextInjector {
         // keystroke and both branches returned the element anyway. Non-text
         // fields are rejected by `tryInject` (getTextValue returns nil).
         let element = focused as! AXUIElement
+        AXUIElementSetMessagingTimeout(element, 0.15)
         return element
     }
 

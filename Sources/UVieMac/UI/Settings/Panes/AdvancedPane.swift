@@ -4,6 +4,7 @@ import SwiftUI
 
 struct AdvancedPane: View {
     @AppStorage(DefaultsKey.modernOrthography) private var modernOrthography: Bool = true
+    @AppStorage(DefaultsKey.checkSpelling) private var checkSpelling: Bool = true
     @AppStorage(DefaultsKey.quickTelex) private var quickTelex: Bool = false
     @AppStorage(DefaultsKey.quickStart) private var quickStart: Bool = false
     @AppStorage(Logger.keystrokeTraceKey) private var keystrokeTrace: Bool = false
@@ -16,6 +17,12 @@ struct AdvancedPane: View {
                                 "Chính tả hiện đại",
                                 "Bật: hoas → hoá (quy tắc mới). Tắt: hoas → hoà (chính tả truyền thống).",
                                 $modernOrthography)
+                }
+                SettingsCard {
+                    SToggleRow("textformat.abc",
+                                "Khôi phục từ tiếng Anh",
+                                "Tự nhận diện từ tiếng Anh phổ biến (tests, system, character…) và giữ nguyên dạng gốc thay vì biến đổi theo Telex.",
+                                $checkSpelling)
                 }
             }
 

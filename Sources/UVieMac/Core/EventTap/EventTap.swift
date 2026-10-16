@@ -95,6 +95,13 @@ final class EventTap: ObservableObject {
     /// handlers; invalidated (reset to 0) wherever the engine is reset.
     var editCaretBack = 0
 
+    /// Key codes whose keyDown was passed through to the app untouched
+    /// (untranslatable glyph, engine-idle empty diff, AX injection declined).
+    /// Their keyUps must also pass through — suppressing them would leave the
+    /// app with a keyDown it never saw released (unbalanced key cycle).
+    /// Entries are removed as the matching keyUp arrives.
+    var passedThroughKeys = Set<Int64>()
+
     /// Remaining one-shot AX bundleID refresh attempts. Armed (set to
     /// `axRefreshMaxAttempts`) when a potential app-switch trigger is
     /// observed (Cmd/Ctrl/Fn flagsChanged, mouse down). Each keyDown in an
@@ -112,6 +119,14 @@ final class EventTap: ObservableObject {
 
     /// AX lookups budgeted per armed trigger — see `axRefreshAttempts`.
     static let axRefreshMaxAttempts = 3
+
+    /// Timeout (seconds) applied to AX IPC on the event-tap callback. AX
+    /// round-trips are synchronous; without a bound, a hung target app stalls
+    /// the callback long enough for the system to disable the tap entirely
+    /// (all keyboard input appears frozen until the next event re-enables it).
+    /// 150ms is generous for a healthy app yet small enough that several
+    /// budgeted lookups cannot accumulate into a tap timeout.
+    static let axMessagingTimeout: Float = 0.15
 
     /// Retry state for `start()` (Bug #1, #6, #10). After a fresh login or
     /// onboarding, `AXIsProcessTrustedWithOptions` can return true from a
@@ -397,6 +412,12 @@ final class EventTap: ObservableObject {
         _engine.setRelaxedCoda(defaults.bool(forKey: DefaultsKey.relaxedCoda))
         _engine.setQuickTelex(defaults.bool(forKey: DefaultsKey.quickTelex))
         _engine.setQuickStart(defaults.bool(forKey: DefaultsKey.quickStart))
+        // Restore-English-words override (dictionary passthrough). The
+        // checkSpelling key defaults to true; treat a missing key as enabled.
+        _engine.setEnglishOverride(
+            defaults.object(forKey: DefaultsKey.checkSpelling) == nil
+                || defaults.bool(forKey: DefaultsKey.checkSpelling)
+        )
         // Cache the post-commit-editing flag too — read on the character-key
         // hot path from the event-tap callback.
         editCommittedEnabled = defaults.object(forKey: DefaultsKey.editCommittedWords) == nil
@@ -554,7 +575,7 @@ final class EventTap: ObservableObject {
     // MARK: - App classification helpers
 
     let breakKeyCodes: Set<Int64> = [
-        36,  48,  53,  116, 121, 123, 124, 125, 126, 115, 119, 114, 117,
+        36,  48,  53,  116, 121, 123, 124, 125, 126, 115, 119, 114, 117, 76,
     ]
 
     func isBreakKey(_ keyCode: Int64) -> Bool {
@@ -615,6 +636,10 @@ final class EventTap: ObservableObject {
     /// uses selection-based backspace which is the less destructive option).
     private func computeIsFocusedFieldWebContent() -> Bool {
         let systemWide = AXUIElementCreateSystemWide()
+        // Bound every AX round-trip on the event-tap callback: a hung target
+        // app would otherwise stall the tap past the system timeout and get
+        // it disabled — freezing all typing.
+        AXUIElementSetMessagingTimeout(systemWide, EventTap.axMessagingTimeout)
         var focused: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
             systemWide,
@@ -629,6 +654,7 @@ final class EventTap: ObservableObject {
         // event-tap callback.
         guard CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
         var element = focused as! AXUIElement
+        AXUIElementSetMessagingTimeout(element, EventTap.axMessagingTimeout)
 
         for _ in 0..<8 {
             var role: CFTypeRef?
@@ -648,6 +674,7 @@ final class EventTap: ObservableObject {
                 return false
             }
             element = parent as! AXUIElement
+            AXUIElementSetMessagingTimeout(element, EventTap.axMessagingTimeout)
         }
         return false
     }

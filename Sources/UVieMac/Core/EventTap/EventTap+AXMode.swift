@@ -56,10 +56,16 @@ extension EventTap {
 
         // Regular character keys
         if type == .keyUp {
+            if passedThroughKeys.remove(keyCode) != nil {
+                // The keyDown passed through untouched — its keyUp must
+                // follow (same invariant as the CGEvent char path).
+                return Unmanaged.passRetained(event)
+            }
             return nil  // Suppress original keyUp
         }
 
         guard let firstChar = characterFromCGEvent(event) else {
+            passedThroughKeys.insert(keyCode)
             return Unmanaged.passRetained(event)
         }
 
@@ -71,7 +77,11 @@ extension EventTap {
         if Logger.shared.keystrokeTraceEnabled {
             Logger.shared.keystroke("axFeed char='\(transformedChar)' success=\(success)")
         }
-        return success ? nil : Unmanaged.passRetained(event)
+        if success { return nil }
+        // Injection declined/failed — the keyDown goes to the app natively,
+        // so mark it: its keyUp must pass through too.
+        passedThroughKeys.insert(keyCode)
+        return Unmanaged.passRetained(event)
     }
 
     func characterFromCGEvent(_ event: CGEvent) -> Character? {
