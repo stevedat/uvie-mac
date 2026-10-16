@@ -27,6 +27,12 @@ final class MenuBarController: ObservableObject {
     init() {
         setupStatusItem()
         setupPopover()
+        // Redraw the icon whenever the update check lands so the blue badge
+        // appears/disappears without waiting for an input-method change.
+        UpdateChecker.shared.$latestVersion
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateIcon() }
+            .store(in: &cancellables)
     }
 
     func setEventTap(_ tap: EventTap) {
@@ -113,6 +119,18 @@ final class MenuBarController: ObservableObject {
             height: size.height
         )
         str.draw(in: letterRect, withAttributes: attrs)
+
+        // Update badge: small blue dot centered on the rounded rect's
+        // top-right corner when a newer release is known. Clears itself
+        // once the app is updated (the version comparison flips).
+        if UpdateChecker.shared.hasUpdate {
+            let d: CGFloat = 4.5
+            let dot = NSRect(x: rect.maxX - d / 2,
+                             y: rect.maxY - d / 2,
+                             width: d, height: d)
+            NSColor.systemBlue.setFill()
+            NSBezierPath(ovalIn: dot).fill()
+        }
 
         img.unlockFocus()
         img.isTemplate = false

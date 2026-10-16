@@ -131,7 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             NSApp.setActivationPolicy(.regular)
         }
 
-        // Start periodic update checks (every 2h, fires once immediately).
+        // Start periodic update checks (every 24h, fires once immediately).
         updateChecker.start()
 
         // Wire the custom global hotkey to toggle Vietnamese/English.
